@@ -1,0 +1,21 @@
+import random
+from pyfingerprint.pyfingerprint import PyFingerprint
+
+blood_groups = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+
+def scan_fingerprint():
+    try:
+        f = PyFingerprint('COM3', 57600)
+
+        if not f.verifyPassword():
+            return None
+
+        while f.readImage() == False:
+            pass
+
+        f.convertImage(0x01)
+
+        return random.choice(blood_groups)
+
+    except:
+        return None
