@@ -15,11 +15,15 @@ class FingerprintThread(QThread):
     finished = Signal(bool)
     progress = Signal(str)
 
+    def __init__(self, port_name):
+        super().__init__()
+        self.port_name = port_name
+
     def run(self):
 
         try:
             self.progress.emit("Connecting to Scanner...")
-            f = PyFingerprint('COM8', 57600, 0xFFFFFFFF, 0x00000000)
+            f = PyFingerprint(self.port_name, 57600, 0xFFFFFFFF, 0x00000000)
 
             if not f.verifyPassword():
                 self.progress.emit("Scanner Password Error")
@@ -31,7 +35,7 @@ class FingerprintThread(QThread):
                 pass
 
             self.progress.emit("Scanning Fingerprint...")
-            f.downloadImage("C:\\fingerprint\\fingerprint.bmp")
+            f.downloadImage("/home/anudeepth/Documents/fingerprint.bmp")
 
             # Simulate processing and extracting for UI feedback
             time.sleep(0.5)
@@ -153,7 +157,9 @@ class MainWindow(QWidget):
             return
 
         ports = [port.device for port in serial.tools.list_ports.comports()]
-        if 'COM8' in ports:
+        self.active_port = next((p for p in ports if 'USB' in p.upper() or 'ACM' in p.upper() or 'COM' in p.upper()), None)
+
+        if self.active_port:
             self.status.setText("Scanner Status : READY")
             self.status.setStyleSheet("color: #4CAF50; font-size: 16px; font-weight: bold; background: transparent;")
             self.scan_btn.setEnabled(True)
@@ -171,7 +177,7 @@ class MainWindow(QWidget):
         self.scan_btn.setEnabled(False)
         self.scan_btn.setText("Scanning...")
 
-        self.thread = FingerprintThread()
+        self.thread = FingerprintThread(self.active_port)
         self.thread.progress.connect(self.update_status)
         self.thread.finished.connect(self.scan_finished)
         self.thread.start()
@@ -188,7 +194,7 @@ class MainWindow(QWidget):
         if success:
 
             # display fingerprint image
-            pixmap = QPixmap("C:\\fingerprint\\fingerprint.bmp")
+            pixmap = QPixmap("/home/anudeepth/Documents/fingerprint.bmp")
             pixmap = pixmap.scaled(250, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.image_label.setPixmap(pixmap)
             self.image_label.setStyleSheet("border: 2px solid #4CAF50; border-radius: 12px; background-color: #FFFFFF;")
