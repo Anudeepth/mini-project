@@ -1,0 +1,9 @@
+venv/
+tf_env/
+__pycache__/
+*.pyc
+*.so
+*.pyd
+.env
+dataset/
+split_dataset/
