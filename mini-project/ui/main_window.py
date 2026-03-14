@@ -302,6 +302,14 @@ class MainWindow(QWidget):
                     self.latest_processed_img = preprocess_fingerprint(img_path, input_shape=input_shape, save_roi_path=roi_path)
                     
                     pred = model.predict(self.latest_processed_img)
+                    
+                    # Log the full probability distribution to terminal to debug confusion
+                    print("-" * 30)
+                    print("Raw Prediction Probabilities:")
+                    for i, prob in enumerate(pred[0]):
+                        print(f"  {blood_groups[i]}: {prob * 100:.2f}%")
+                    print("-" * 30)
+                    
                     index = np.argmax(pred)
                     blood = blood_groups[index]
                     confidence = int(pred[0][index] * 100)
