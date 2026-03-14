@@ -146,6 +146,36 @@ class MainWindow(QWidget):
         image_layout.addWidget(self.image_label)
         image_layout.addStretch()
 
+        from PySide6.QtWidgets import QProgressBar, QGridLayout
+        
+        # Probability chart
+        self.chart_layout = QGridLayout()
+        self.bars = {}
+        for i, bg in enumerate(blood_groups):
+            lbl = QLabel(bg)
+            lbl.setStyleSheet("font-weight: bold; color: #2E3B32;")
+            bar = QProgressBar()
+            bar.setTextVisible(True)
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #81C784;
+                    border-radius: 4px;
+                    text-align: center;
+                    color: black;
+                }
+                QProgressBar::chunk {
+                    background-color: #4CAF50;
+                }
+            """)
+            self.bars[bg] = bar
+            
+            row = i // 2
+            col = (i % 2) * 2
+            self.chart_layout.addWidget(lbl, row, col)
+            self.chart_layout.addWidget(bar, row, col + 1)
+
         self.result = QLabel("Blood Group : —")
         self.result.setAlignment(Qt.AlignCenter)
         self.result.setStyleSheet("""
@@ -226,6 +256,7 @@ class MainWindow(QWidget):
         layout.addWidget(self.title)
         layout.addWidget(self.status)
         layout.addLayout(image_layout)
+        layout.addLayout(self.chart_layout)
         layout.addWidget(self.result)
         layout.addWidget(self.scan_btn)
         layout.addLayout(teach_layout)
@@ -290,7 +321,9 @@ class MainWindow(QWidget):
                     print("-" * 30)
                     print("Raw Prediction Probabilities:")
                     for i, prob in enumerate(pred[0]):
+                        percent_val = int(prob * 100)
                         print(f"  {blood_groups[i]}: {prob * 100:.2f}%")
+                        self.bars[blood_groups[i]].setValue(percent_val)
                     print("-" * 30)
                     
                     index = np.argmax(pred)
