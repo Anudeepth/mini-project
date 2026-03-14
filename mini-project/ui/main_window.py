@@ -6,8 +6,64 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QPixmap
 from pyfingerprint.pyfingerprint import PyFingerprint
 
+import cv2
+import numpy as np
+from tensorflow.keras.models import load_model
+import os
 
-blood_groups = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+# Keras ImageDataGenerator loads directories in strict alphanumeric order.
+# The `dataset/` folder contains A+, A-, AB+, AB-, B+, B-, O+, O-.
+# Sorted alphabetically: ['A+', 'A-', 'AB+', 'AB-', 'B+', 'B-', 'O+', 'O-']
+blood_groups = ["A+", "A-", "AB+", "AB-", "B+", "B-", "O+", "O-"]
+
+# Load the model once when the app starts
+model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fingerprint_model.keras")
+try:
+    model = load_model(model_path)
+except Exception as e:
+    print(f"Error loading model: {e}")
+    model = None
+
+def preprocess_fingerprint(img_path, input_shape=(128,128,1), save_roi_path=None):
+    """Preprocess image with MinMax stretching and standard equalization"""
+    img = cv2.imread(img_path)
+    if img is None:
+        raise ValueError(f"Could not read image at {img_path}")
+        
+    # Convert to grayscale if model expects 1 channel
+    if input_shape[2] == 1:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+    # Resize to model input size
+    img = cv2.resize(img, (input_shape[0], input_shape[1]))
+    
+    # NEW: Contrast Stretching. This fixes "diminished" or faint fingerprint captures 
+    # by stretching the faintest gray to pure black and the lightest to pure white
+    # before applying equalization.
+    if input_shape[2] == 1:
+        img = cv2.normalize(img, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+    
+    # Improve contrast exactly as test_script did
+    img_eq = cv2.equalizeHist(img) if input_shape[2]==1 else img
+        
+    # Save the preview image for the UI
+    if save_roi_path:
+        cv2.imwrite(save_roi_path, img_eq)
+
+    # Noise reduction
+    img_processed = cv2.GaussianBlur(img_eq,(3,3),0)
+    
+    # Normalize
+    img_processed = img_processed / 255.0
+    
+    # Add channel dimension if needed
+    if input_shape[2] == 1:
+        img_processed = np.expand_dims(img_processed, axis=-1)
+        
+    # Add batch dimension
+    img_processed = np.expand_dims(img_processed, axis=0)
+    
+    return img_processed
 
 
 class FingerprintThread(QThread):
@@ -144,11 +200,52 @@ class MainWindow(QWidget):
         """)
         self.scan_btn.clicked.connect(self.start_scan)
 
+        from PySide6.QtWidgets import QComboBox
+
+        # Teach Model Control Area
+        teach_layout = QHBoxLayout()
+        teach_layout.setSpacing(10)
+        
+        self.teach_label = QLabel("Correct Prediction:")
+        self.teach_label.setStyleSheet("color: #1B5E20; font-weight: bold;")
+        
+        self.teach_combo = QComboBox()
+        self.teach_combo.addItems(blood_groups)
+        self.teach_combo.setStyleSheet("""
+            QComboBox {
+                padding: 5px;
+                border: 1px solid #C8E6C9;
+                border-radius: 4px;
+                min-width: 80px;
+            }
+        """)
+        
+        self.teach_btn = QPushButton("Teach Model")
+        self.teach_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 8px 15px;
+            }
+            QPushButton:hover { background-color: #F57C00; }
+        """)
+        self.teach_btn.clicked.connect(self.teach_model)
+        self.teach_btn.setEnabled(False) # Disabled until a scan completes
+
+        teach_layout.addStretch()
+        teach_layout.addWidget(self.teach_label)
+        teach_layout.addWidget(self.teach_combo)
+        teach_layout.addWidget(self.teach_btn)
+        teach_layout.addStretch()
+
         layout.addWidget(self.title)
         layout.addWidget(self.status)
         layout.addLayout(image_layout)
-        layout.addWidget(self.scan_btn)
         layout.addWidget(self.result)
+        layout.addWidget(self.scan_btn)
+        layout.addLayout(teach_layout)
 
         self.setLayout(layout)
 
@@ -194,17 +291,93 @@ class MainWindow(QWidget):
         if success:
 
             # display fingerprint image
-            pixmap = QPixmap("/home/anudeepth/Documents/fingerprint.bmp")
+            img_path = "/home/anudeepth/Documents/fingerprint.bmp"
+            roi_path = "/home/anudeepth/Documents/fingerprint_roi.bmp"
+
+            if model is not None:
+                try:
+                    input_shape = model.input_shape[1:]
+                    
+                    # Store latest processed img globally for training
+                    self.latest_processed_img = preprocess_fingerprint(img_path, input_shape=input_shape, save_roi_path=roi_path)
+                    
+                    pred = model.predict(self.latest_processed_img)
+                    index = np.argmax(pred)
+                    blood = blood_groups[index]
+                    confidence = int(pred[0][index] * 100)
+                    self.result.setText(f"Blood Group : {blood} ({confidence}%)")
+                    
+                    # Enable teach button & select predicted blood group
+                    self.teach_combo.setCurrentText(blood)
+                    self.teach_btn.setEnabled(True)
+                    
+                except Exception as e:
+                    print(f"Prediction error: {e}")
+                    self.result.setText("Prediction Error")
+            else:
+                 self.result.setText("Model Not Loaded")
+
+            # display the enhanced fingerprint image instead of raw capture
+            if os.path.exists(roi_path):
+                pixmap = QPixmap(roi_path)
+            else:
+                pixmap = QPixmap(img_path)
+                
             pixmap = pixmap.scaled(250, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.image_label.setPixmap(pixmap)
             self.image_label.setStyleSheet("border: 2px solid #4CAF50; border-radius: 12px; background-color: #FFFFFF;")
-
-            # random prediction
-            blood = random.choice(blood_groups)
-            confidence = random.randint(90, 99)
-
-            self.result.setText(f"Blood Group : {blood} ({confidence}%)")
+            
+            self.status.setText("Fingerprint Captured")
             self.status.setText("Fingerprint Captured")
 
         else:
             self.status.setText("Scanner Error. Please try again.")
+
+    def teach_model(self):
+        if model is None or not hasattr(self, 'latest_processed_img'):
+            return
+            
+        true_blood_group = self.teach_combo.currentText()
+        true_index = blood_groups.index(true_blood_group)
+        
+        # Create one-hot encoded label
+        y_true = np.zeros((1, len(blood_groups)))
+        y_true[0, true_index] = 1.0
+        
+        self.status.setText(f"Teaching model for {true_blood_group}...")
+        self.status.setStyleSheet("color: #FF9800; font-size: 16px; font-weight: bold; background: transparent;")
+        self.teach_btn.setEnabled(False)
+        self.scan_btn.setEnabled(False)
+        
+        # Train
+        try:
+            # Prevent 'catastrophic forgetting' by using a very small learning rate
+            # so we only nudge the weights towards this new print, instead of rewriting them entirely.
+            from tensorflow.keras.optimizers import Adam
+            optimizer = Adam(learning_rate=0.00005)
+            
+            # Recompile specifically to accept one-hot encoded `categorical_crossentropy`
+            model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+            
+            # Use only 2 epochs to prevent the model from overfitting to this single image
+            model.fit(self.latest_processed_img, y_true, epochs=2, verbose=1)
+            model.save(model_path)
+            self.status.setText(f"Model Learned: {true_blood_group}! Model Saved.")
+            self.status.setStyleSheet("color: #4CAF50; font-size: 16px; font-weight: bold; background: transparent;")
+            
+            # Optionally copy fingerprint.bmp to dataset folder
+            import shutil
+            dataset_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dataset", true_blood_group)
+            if not os.path.exists(dataset_dir):
+                os.makedirs(dataset_dir)
+            
+            img_count = len(os.listdir(dataset_dir))
+            shutil.copy("/home/anudeepth/Documents/fingerprint.bmp", 
+                        os.path.join(dataset_dir, f"live_capture_{img_count+1}.bmp"))
+            
+        except Exception as e:
+            print(f"Teaching error: {e}")
+            self.status.setText("Error saving weights.")
+            
+        self.teach_btn.setEnabled(True)
+        self.scan_btn.setEnabled(True)
