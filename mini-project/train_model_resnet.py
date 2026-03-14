@@ -49,8 +49,16 @@ base_model = ResNet50V2(input_shape=(128, 128, 3),
                         include_top=False,
                         weights='imagenet')
 
-# Freeze the convolutional base
-base_model.trainable = False
+# FINE-TUNING:
+# Unfreeze the base model so we can alter its core weights
+base_model.trainable = True
+
+# We want to freeze the very bottom layers (which detect simple lines) 
+# and only train the top ~30 layers (which detect complex fingerprint loops/whorls).
+fine_tune_at = len(base_model.layers) - 30
+
+for layer in base_model.layers[:fine_tune_at]:
+    layer.trainable = False
 
 # Build the complete model
 inputs = keras.Input(shape=(128, 128, 3))
@@ -73,19 +81,27 @@ outputs = layers.Dense(8, activation='softmax')(x)
 model = keras.Model(inputs, outputs)
 
 # Compile the model
-print("Compiling model...")
-model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001),
+# Using a very low learning rate for fine-tuning so we don't destroy the pre-trained weights
+print("Compiling model for Fine-Tuning...")
+model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0001),
               loss='categorical_crossentropy',
               metrics=['accuracy'])
 
 model.summary()
 
+# Callbacks: Automate the training process so it perfectly stops when accuracy peaks
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+early_stopping = EarlyStopping(monitor='val_accuracy', patience=4, restore_best_weights=True, verbose=1)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1)
+
 # Train the top layer
-print("Training custom classification head...")
+print("Training custom classification head & Top 30 ResNet Layers...")
 history = model.fit(train_ds,
-                    epochs=3,
-                    validation_data=val_ds)
+                    epochs=20, # Let EarlyStopping decide when to quit
+                    validation_data=val_ds,
+                    callbacks=[early_stopping, reduce_lr])
 
 # Save the mighty new brain
 model.save("resnet_fingerprint_model.keras")
-print("\nSuccess! Saved higher-accuracy model to resnet_fingerprint_model.keras")
+print("\nSuccess! Saved fine-tuned maximum-accuracy model to resnet_fingerprint_model.keras")
