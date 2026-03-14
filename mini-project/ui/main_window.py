@@ -16,51 +16,34 @@ import os
 # Sorted alphabetically: ['A+', 'A-', 'AB+', 'AB-', 'B+', 'B-', 'O+', 'O-']
 blood_groups = ["A+", "A-", "AB+", "AB-", "B+", "B-", "O+", "O-"]
 
-# Load the model once when the app starts
-model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fingerprint_model.keras")
+# Load the highly-accurate ResNet50V2 model
+model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resnet_fingerprint_model.keras")
 try:
     model = load_model(model_path)
 except Exception as e:
-    print(f"Error loading model: {e}")
+    print(f"Error loading ResNet model: {e}")
     model = None
 
-def preprocess_fingerprint(img_path, input_shape=(128,128,1), save_roi_path=None):
-    """Preprocess image with MinMax stretching and standard equalization"""
+def preprocess_fingerprint(img_path, input_shape=(128,128,3), save_roi_path=None):
+    """Preprocess image using native ResNet50V2 normalization function"""
     img = cv2.imread(img_path)
     if img is None:
         raise ValueError(f"Could not read image at {img_path}")
         
-    # Convert to grayscale if model expects 1 channel
-    if input_shape[2] == 1:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-    # Resize to model input size
-    img = cv2.resize(img, (input_shape[0], input_shape[1]))
+    # Keras models trained on image_dataset_from_directory expect standard RGB colors
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # NEW: Contrast Stretching. This fixes "diminished" or faint fingerprint captures 
-    # by stretching the faintest gray to pure black and the lightest to pure white
-    # before applying equalization.
-    if input_shape[2] == 1:
-        img = cv2.normalize(img, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
-    
-    # Improve contrast exactly as test_script did
-    img_eq = cv2.equalizeHist(img) if input_shape[2]==1 else img
-        
-    # Save the preview image for the UI
+    # Save the preview image for the UI BEFORE resizing, so it doesn't look zoomed/squished!
     if save_roi_path:
-        cv2.imwrite(save_roi_path, img_eq)
-
-    # Noise reduction
-    img_processed = cv2.GaussianBlur(img_eq,(3,3),0)
-    
-    # Normalize
-    img_processed = img_processed / 255.0
-    
-    # Add channel dimension if needed
-    if input_shape[2] == 1:
-        img_processed = np.expand_dims(img_processed, axis=-1)
+        cv2.imwrite(save_roi_path, img) 
         
+    # Resize to model input size (This squishes the 256x288 image into a 128x128 square)
+    img_resized = cv2.resize(img_rgb, (input_shape[0], input_shape[1]))
+
     # Add batch dimension
+    # The image is kept as [0, 255] floats because the Keras model ALREADY has
+    # the tensorflow.keras.applications.resnet_v2.preprocess_input layer embedded inside of it!
+    img_processed = img_resized.astype('float32')
     img_processed = np.expand_dims(img_processed, axis=0)
     
     return img_processed
