@@ -1,4 +1,3 @@
-import random
 import time
 import serial.tools.list_ports
 from PySide6.QtWidgets import QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout
@@ -8,16 +7,21 @@ from pyfingerprint.pyfingerprint import PyFingerprint
 
 import cv2
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras.models import load_model
 import os
+import shutil
 
 # Keras ImageDataGenerator loads directories in strict alphanumeric order.
 # The `dataset/` folder contains A+, A-, AB+, AB-, B+, B-, O+, O-.
 # Sorted alphabetically: ['A+', 'A-', 'AB+', 'AB-', 'B+', 'B-', 'O+', 'O-']
 blood_groups = ["A+", "A-", "AB+", "AB-", "B+", "B-", "O+", "O-"]
 
-# Load the highly-accurate ResNet50V2 model
+# Paths
 model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resnet_fingerprint_model.keras")
+dataset_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dataset")
+
+# Load the ResNet50V2 model
 try:
     model = load_model(model_path)
 except Exception as e:
@@ -25,20 +29,43 @@ except Exception as e:
     model = None
 
 def preprocess_fingerprint(img_path, input_shape=(128,128,3), save_roi_path=None):
-    """Preprocess image using native ResNet50V2 normalization function"""
+    """Preprocess scanner image to match dataset quality before prediction.
+    
+    Scanner images are faded (mean~239, std~31) while dataset images are
+    high-contrast (mean~150, std~100). We apply CLAHE + histogram equalization
+    to bridge this quality gap.
+    """
     img = cv2.imread(img_path)
     if img is None:
         raise ValueError(f"Could not read image at {img_path}")
-        
-    # Keras models trained on image_dataset_from_directory expect standard RGB colors
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # Save the preview image for the UI BEFORE resizing, so it doesn't look zoomed/squished!
+    # --- Enhancement: fix the faded scanner output ---
+    # Convert to grayscale for enhancement
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Step 1: CLAHE — boosts local contrast to reveal faint fingerprint ridges
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    
+    # Step 2: Global histogram equalization — normalizes overall brightness
+    # to match the dataset distribution (mean~150, std~100)
+    enhanced = cv2.equalizeHist(enhanced)
+    
+    # Step 3: Light Gaussian blur to reduce scanner noise
+    enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    
+    # Convert back to 3-channel RGB (model expects 3 channels)
+    img_enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    
+    # Save the enhanced preview image for the UI
     if save_roi_path:
-        cv2.imwrite(save_roi_path, img) 
+        cv2.imwrite(save_roi_path, cv2.cvtColor(img_enhanced, cv2.COLOR_RGB2BGR))
+    
+    # Log stats so we can verify the enhancement is working
+    print(f"  Preprocessing: original mean={gray.mean():.0f} std={gray.std():.0f} → enhanced mean={enhanced.mean():.0f} std={enhanced.std():.0f}")
         
-    # Resize to model input size (This squishes the 256x288 image into a 128x128 square)
-    img_resized = cv2.resize(img_rgb, (input_shape[0], input_shape[1]))
+    # Resize to model input size
+    img_resized = cv2.resize(img_enhanced, (input_shape[0], input_shape[1]))
 
     # Add batch dimension
     # The image is kept as [0, 255] floats because the Keras model ALREADY has
@@ -90,15 +117,164 @@ class FingerprintThread(QThread):
             self.finished.emit(False)
 
 
+class RetrainThread(QThread):
+    """Background thread for proper full-dataset model retraining."""
+
+    progress = Signal(str)
+    finished = Signal(bool, str)  # (success, message)
+
+    def run(self):
+        try:
+            from tensorflow import keras
+            from tensorflow.keras import layers
+            from tensorflow.keras.applications import ResNet50V2
+            from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+            IMG_SIZE = (128, 128)
+            BATCH_SIZE = 32
+
+            self.progress.emit("Loading dataset...")
+
+            train_ds = tf.keras.utils.image_dataset_from_directory(
+                dataset_path,
+                validation_split=0.2,
+                subset="training",
+                seed=123,
+                image_size=IMG_SIZE,
+                batch_size=BATCH_SIZE,
+                label_mode='categorical'
+            )
+
+            val_ds = tf.keras.utils.image_dataset_from_directory(
+                dataset_path,
+                validation_split=0.2,
+                subset="validation",
+                seed=123,
+                image_size=IMG_SIZE,
+                batch_size=BATCH_SIZE,
+                label_mode='categorical'
+            )
+
+            class_names = train_ds.class_names
+            print("Retrain - Classes identified:", class_names)
+
+            self.progress.emit("Applying CLAHE+HistEq preprocessing to dataset...")
+
+            # ---- CRITICAL: Apply the SAME enhancement used at inference time ----
+            # This ensures the model trains on images that look like what the scanner produces.
+            def enhance_image_batch(images, labels):
+                """Apply CLAHE + histogram equalization to a batch of images (via numpy)."""
+                def _enhance_batch_np(img_batch):
+                    batch = img_batch.numpy().astype(np.uint8)
+                    enhanced_batch = []
+                    for img in batch:
+                        # Convert to grayscale
+                        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                        # CLAHE
+                        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                        enhanced = clahe.apply(gray)
+                        # Global histogram equalization
+                        enhanced = cv2.equalizeHist(enhanced)
+                        # Gaussian blur
+                        enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+                        # Back to 3-channel
+                        enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+                        enhanced_batch.append(enhanced_rgb)
+                    return np.array(enhanced_batch, dtype=np.float32)
+
+                enhanced = tf.py_function(_enhance_batch_np, [images], tf.float32)
+                enhanced.set_shape(images.shape)
+                return enhanced, labels
+
+            # Apply enhancement to both train and validation sets
+            train_ds = train_ds.map(enhance_image_batch, num_parallel_calls=tf.data.AUTOTUNE)
+            val_ds = val_ds.map(enhance_image_batch, num_parallel_calls=tf.data.AUTOTUNE)
+
+            # Prefetch for performance
+            train_ds = train_ds.prefetch(tf.data.AUTOTUNE)
+            val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
+
+            self.progress.emit("Building fresh ResNet50V2 model...")
+
+            # ResNet50V2 preprocessing
+            preprocess_input = tf.keras.applications.resnet_v2.preprocess_input
+
+            # Data augmentation
+            data_augmentation = keras.Sequential([
+                layers.RandomFlip("horizontal"),
+                layers.RandomRotation(0.1),
+                layers.RandomZoom(0.1),
+            ])
+
+            # Create FRESH base model from pre-trained ImageNet weights
+            base_model = ResNet50V2(input_shape=(128, 128, 3),
+                                    include_top=False,
+                                    weights='imagenet')
+
+            # Fine-tune: unfreeze top 30 layers
+            base_model.trainable = True
+            fine_tune_at = len(base_model.layers) - 30
+            for layer_item in base_model.layers[:fine_tune_at]:
+                layer_item.trainable = False
+
+            # Build complete model
+            inputs = keras.Input(shape=(128, 128, 3))
+            x = data_augmentation(inputs)
+            x = preprocess_input(x)
+            x = base_model(x, training=False)
+            x = layers.GlobalAveragePooling2D()(x)
+            x = layers.Dropout(0.2)(x)
+            outputs = layers.Dense(len(blood_groups), activation='softmax')(x)
+            new_model = keras.Model(inputs, outputs)
+
+            new_model.compile(
+                optimizer=keras.optimizers.Adam(learning_rate=0.0001),
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
+
+            early_stopping = EarlyStopping(
+                monitor='val_accuracy', patience=4,
+                restore_best_weights=True, verbose=1
+            )
+            reduce_lr = ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5,
+                patience=2, min_lr=1e-6, verbose=1
+            )
+
+            self.progress.emit("Training on full dataset (this may take a while)...")
+
+            history = new_model.fit(
+                train_ds,
+                epochs=20,
+                validation_data=val_ds,
+                callbacks=[early_stopping, reduce_lr]
+            )
+
+            # Get final accuracy
+            final_val_acc = history.history['val_accuracy'][-1] * 100
+
+            # Save the newly trained model
+            new_model.save(model_path)
+
+            self.finished.emit(True, f"Retrain complete! Val accuracy: {final_val_acc:.1f}%")
+
+        except Exception as e:
+            print(f"Retrain error: {e}")
+            self.finished.emit(False, str(e))
+
+
 class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("Blood Group Detection Using Fingerprint")
-        self.resize(600, 600)
+        self.resize(600, 700)
         
         self.is_scanning = False
+        self.is_retraining = False
+        self.new_images_count = 0  # Track images collected since last training
 
         # Setup connection timer to monitor scanner presence
         self.connection_timer = QTimer(self)
@@ -215,11 +391,11 @@ class MainWindow(QWidget):
 
         from PySide6.QtWidgets import QComboBox
 
-        # Teach Model Control Area
+        # Teach Model Control Area (data collection only — no more model.fit!)
         teach_layout = QHBoxLayout()
         teach_layout.setSpacing(10)
         
-        self.teach_label = QLabel("Correct Prediction:")
+        self.teach_label = QLabel("Correct Blood Group:")
         self.teach_label.setStyleSheet("color: #1B5E20; font-weight: bold;")
         
         self.teach_combo = QComboBox()
@@ -233,7 +409,7 @@ class MainWindow(QWidget):
             }
         """)
         
-        self.teach_btn = QPushButton("Teach Model")
+        self.teach_btn = QPushButton("Save to Dataset")
         self.teach_btn.setStyleSheet("""
             QPushButton {
                 background-color: #FF9800;
@@ -243,6 +419,7 @@ class MainWindow(QWidget):
                 padding: 8px 15px;
             }
             QPushButton:hover { background-color: #F57C00; }
+            QPushButton:disabled { background-color: #FFCC80; }
         """)
         self.teach_btn.clicked.connect(self.teach_model)
         self.teach_btn.setEnabled(False) # Disabled until a scan completes
@@ -253,6 +430,35 @@ class MainWindow(QWidget):
         teach_layout.addWidget(self.teach_btn)
         teach_layout.addStretch()
 
+        # New images counter + Retrain button
+        retrain_layout = QHBoxLayout()
+        retrain_layout.setSpacing(10)
+
+        self.new_images_label = QLabel("New images collected: 0")
+        self.new_images_label.setStyleSheet("color: #555; font-size: 13px;")
+
+        self.retrain_btn = QPushButton("🔄 Retrain Model on Full Dataset")
+        self.retrain_btn.setMinimumHeight(45)
+        self.retrain_btn.setCursor(Qt.PointingHandCursor)
+        self.retrain_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1565C0;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 22px;
+                padding: 8px 20px;
+            }
+            QPushButton:hover { background-color: #1976D2; }
+            QPushButton:pressed { background-color: #0D47A1; }
+            QPushButton:disabled { background-color: #90CAF9; }
+        """)
+        self.retrain_btn.clicked.connect(self.start_retrain)
+
+        retrain_layout.addWidget(self.new_images_label)
+        retrain_layout.addStretch()
+        retrain_layout.addWidget(self.retrain_btn)
+
         layout.addWidget(self.title)
         layout.addWidget(self.status)
         layout.addLayout(image_layout)
@@ -260,11 +466,12 @@ class MainWindow(QWidget):
         layout.addWidget(self.result)
         layout.addWidget(self.scan_btn)
         layout.addLayout(teach_layout)
+        layout.addLayout(retrain_layout)
 
         self.setLayout(layout)
 
     def check_scanner_connection(self):
-        if self.is_scanning:
+        if self.is_scanning or self.is_retraining:
             return
 
         ports = [port.device for port in serial.tools.list_ports.comports()]
@@ -312,12 +519,13 @@ class MainWindow(QWidget):
                 try:
                     input_shape = model.input_shape[1:]
                     
-                    # Store latest processed img globally for training
+                    # Store latest image path for dataset collection
+                    self.latest_img_path = img_path
                     self.latest_processed_img = preprocess_fingerprint(img_path, input_shape=input_shape, save_roi_path=roi_path)
                     
                     pred = model.predict(self.latest_processed_img)
                     
-                    # Log the full probability distribution to terminal to debug confusion
+                    # Log the full probability distribution to terminal
                     print("-" * 30)
                     print("Raw Prediction Probabilities:")
                     for i, prob in enumerate(pred[0]):
@@ -352,56 +560,85 @@ class MainWindow(QWidget):
             self.image_label.setStyleSheet("border: 2px solid #4CAF50; border-radius: 12px; background-color: #FFFFFF;")
             
             self.status.setText("Fingerprint Captured")
-            self.status.setText("Fingerprint Captured")
 
         else:
             self.status.setText("Scanner Error. Please try again.")
 
     def teach_model(self):
-        if model is None or not hasattr(self, 'latest_processed_img'):
+        """Save the scanned fingerprint to the dataset folder (NO model training).
+        
+        This only collects data. To actually improve the model, click "Retrain Model"
+        after collecting enough new images.
+        """
+        if not hasattr(self, 'latest_img_path'):
             return
             
         true_blood_group = self.teach_combo.currentText()
-        true_index = blood_groups.index(true_blood_group)
         
-        # Create one-hot encoded label
-        y_true = np.zeros((1, len(blood_groups)))
-        y_true[0, true_index] = 1.0
-        
-        self.status.setText(f"Teaching model for {true_blood_group}...")
-        self.status.setStyleSheet("color: #FF9800; font-size: 16px; font-weight: bold; background: transparent;")
-        self.teach_btn.setEnabled(False)
-        self.scan_btn.setEnabled(False)
-        
-        # Train
         try:
-            # Prevent 'catastrophic forgetting' by using a very small learning rate
-            # so we only nudge the weights towards this new print, instead of rewriting them entirely.
-            from tensorflow.keras.optimizers import Adam
-            optimizer = Adam(learning_rate=0.00005)
+            # Copy fingerprint to the correct blood group dataset folder
+            bg_dataset_dir = os.path.join(dataset_path, true_blood_group)
+            if not os.path.exists(bg_dataset_dir):
+                os.makedirs(bg_dataset_dir)
             
-            # Recompile specifically to accept one-hot encoded `categorical_crossentropy`
-            model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+            img_count = len(os.listdir(bg_dataset_dir))
+            dest_path = os.path.join(bg_dataset_dir, f"live_capture_{img_count+1}.bmp")
+            shutil.copy(self.latest_img_path, dest_path)
             
-            # Use only 2 epochs to prevent the model from overfitting to this single image
-            model.fit(self.latest_processed_img, y_true, epochs=2, verbose=1)
-            model.save(model_path)
-            self.status.setText(f"Model Learned: {true_blood_group}! Model Saved.")
+            self.new_images_count += 1
+            self.new_images_label.setText(f"New images collected: {self.new_images_count}")
+            
+            self.status.setText(f"✅ Saved fingerprint as {true_blood_group} to dataset ({self.new_images_count} new)")
             self.status.setStyleSheet("color: #4CAF50; font-size: 16px; font-weight: bold; background: transparent;")
             
-            # Optionally copy fingerprint.bmp to dataset folder
-            import shutil
-            dataset_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dataset", true_blood_group)
-            if not os.path.exists(dataset_dir):
-                os.makedirs(dataset_dir)
-            
-            img_count = len(os.listdir(dataset_dir))
-            shutil.copy("/home/anudeepth/Documents/fingerprint.bmp", 
-                        os.path.join(dataset_dir, f"live_capture_{img_count+1}.bmp"))
+            print(f"Saved fingerprint to {dest_path}")
             
         except Exception as e:
-            print(f"Teaching error: {e}")
-            self.status.setText("Error saving weights.")
+            print(f"Save error: {e}")
+            self.status.setText(f"Error saving: {e}")
             
-        self.teach_btn.setEnabled(True)
+        self.teach_btn.setEnabled(False)  # Disable until next scan
+
+    def start_retrain(self):
+        """Start full-dataset retraining in a background thread."""
+        global model
+
+        self.is_retraining = True
+        self.retrain_btn.setEnabled(False)
+        self.retrain_btn.setText("⏳ Retraining...")
+        self.scan_btn.setEnabled(False)
+        self.teach_btn.setEnabled(False)
+
+        self.status.setText("Retraining model on full dataset — please wait...")
+        self.status.setStyleSheet("color: #1565C0; font-size: 16px; font-weight: bold; background: transparent;")
+
+        self.retrain_thread = RetrainThread()
+        self.retrain_thread.progress.connect(self.update_status)
+        self.retrain_thread.finished.connect(self.retrain_finished)
+        self.retrain_thread.start()
+
+    def retrain_finished(self, success, message):
+        """Called when the retrain thread finishes."""
+        global model
+
+        self.is_retraining = False
+        self.retrain_btn.setEnabled(True)
+        self.retrain_btn.setText("🔄 Retrain Model on Full Dataset")
         self.scan_btn.setEnabled(True)
+
+        if success:
+            # Reload the freshly trained model
+            try:
+                model = load_model(model_path)
+                print("Reloaded retrained model successfully.")
+            except Exception as e:
+                print(f"Error reloading model: {e}")
+
+            self.new_images_count = 0
+            self.new_images_label.setText("New images collected: 0")
+
+            self.status.setText(f"✅ {message}")
+            self.status.setStyleSheet("color: #4CAF50; font-size: 16px; font-weight: bold; background: transparent;")
+        else:
+            self.status.setText(f"❌ Retrain failed: {message}")
+            self.status.setStyleSheet("color: #F44336; font-size: 16px; font-weight: bold; background: transparent;")
