@@ -1,107 +1,159 @@
+import json
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications import ResNet50V2
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
-train_dir = "dataset" # We will use the full dataset folder
-IMG_SIZE = (128, 128)
+# ─────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────
+TRAIN_DIR = "split_dataset/train"        # ✅ Fixed: use the large 4,196-image dataset
+VAL_DIR   = "split_dataset/validation"   # ✅ Fixed: use pre-split validation folder
+IMG_SIZE  = (128, 128)
 BATCH_SIZE = 32
 
+# ─────────────────────────────────────────
 # Load dataset
+# ─────────────────────────────────────────
 print("Loading dataset...")
 train_ds = tf.keras.utils.image_dataset_from_directory(
-    train_dir,
-    validation_split=0.2,
-    subset="training",
-    seed=123,
+    TRAIN_DIR,
     image_size=IMG_SIZE,
     batch_size=BATCH_SIZE,
-    label_mode='categorical'
+    label_mode='categorical',
+    shuffle=True,
+    seed=42
 )
 
 val_ds = tf.keras.utils.image_dataset_from_directory(
-    train_dir,
-    validation_split=0.2,
-    subset="validation",
-    seed=123,
+    VAL_DIR,
     image_size=IMG_SIZE,
     batch_size=BATCH_SIZE,
-    label_mode='categorical'
+    label_mode='categorical',
+    shuffle=False,
+    seed=42
 )
 
 class_names = train_ds.class_names
 print("Classes identified:", class_names)
 
-# ResNet50V2 expects inputs from [-1, 1], so we normalize accordingly
-# The native preprocessing layer for ResNet50V2 handles this:
+# ✅ Save class names to JSON so inference always uses the exact same order
+with open("class_names.json", "w") as f:
+    json.dump(class_names, f)
+print("Class names saved to class_names.json")
+
+# ─────────────────────────────────────────
+# Preprocessing — ResNet50V2 expects [-1, 1]
+# Applied identically at train + inference time
+# ─────────────────────────────────────────
 preprocess_input = tf.keras.applications.resnet_v2.preprocess_input
 
-# Data Augmentation to prevent overfitting on such a complex model
+# ─────────────────────────────────────────
+# Data augmentation (train only)
+# ─────────────────────────────────────────
 data_augmentation = keras.Sequential([
-    layers.RandomFlip("horizontal"),
+    layers.RandomFlip("horizontal_and_vertical"),
     layers.RandomRotation(0.1),
     layers.RandomZoom(0.1),
-])
+    layers.RandomBrightness(0.1),
+    layers.RandomContrast(0.1),
+], name="augmentation")
 
-# Create the base model from the pre-trained model ResNet50V2
-# We set include_top=False to discard the 1000-class ImageNet head
-base_model = ResNet50V2(input_shape=(128, 128, 3),
-                        include_top=False,
-                        weights='imagenet')
+# ─────────────────────────────────────────
+# Performance: cache & prefetch
+# ─────────────────────────────────────────
+AUTOTUNE = tf.data.AUTOTUNE
+train_ds = train_ds.cache().shuffle(1000).prefetch(AUTOTUNE)
+val_ds   = val_ds.cache().prefetch(AUTOTUNE)
 
-# FINE-TUNING:
-# Unfreeze the base model so we can alter its core weights
+# ─────────────────────────────────────────
+# Build model — ResNet50V2 backbone
+# ─────────────────────────────────────────
+base_model = ResNet50V2(
+    input_shape=(128, 128, 3),
+    include_top=False,
+    weights='imagenet'
+)
+
+# Freeze all backbone layers first (transfer learning phase)
+base_model.trainable = False
+
+inputs = keras.Input(shape=(128, 128, 3))
+x = data_augmentation(inputs)
+x = preprocess_input(x)                        # ✅ Consistent preprocessing
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dense(256, activation='relu')(x)
+x = layers.Dropout(0.3)(x)
+outputs = layers.Dense(len(class_names), activation='softmax')(x)
+model = keras.Model(inputs, outputs)
+
+# ─────────────────────────────────────────
+# Phase 1: Train classification head only
+# ─────────────────────────────────────────
+print("\n=== Phase 1: Training classification head ===")
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+model.summary()
+
+early_stop_phase1 = EarlyStopping(
+    monitor='val_accuracy', patience=5,
+    restore_best_weights=True, verbose=1
+)
+
+history1 = model.fit(
+    train_ds,
+    epochs=15,
+    validation_data=val_ds,
+    callbacks=[early_stop_phase1]
+)
+
+# ─────────────────────────────────────────
+# Phase 2: Fine-tune top ResNet layers
+# ─────────────────────────────────────────
+print("\n=== Phase 2: Fine-tuning top 50 ResNet layers ===")
 base_model.trainable = True
 
-# We want to freeze the very bottom layers (which detect simple lines) 
-# and only train the top ~30 layers (which detect complex fingerprint loops/whorls).
-fine_tune_at = len(base_model.layers) - 30
-
+# Freeze everything except the top 50 layers
+fine_tune_at = len(base_model.layers) - 50
 for layer in base_model.layers[:fine_tune_at]:
     layer.trainable = False
 
-# Build the complete model
-inputs = keras.Input(shape=(128, 128, 3))
-x = data_augmentation(inputs)
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-4),   # ✅ Lower LR for fine-tuning
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
 
-# Standard preprocessing for ResNet
-x = preprocess_input(x)
+early_stop_phase2 = EarlyStopping(
+    monitor='val_accuracy', patience=5,
+    restore_best_weights=True, verbose=1
+)
+reduce_lr = ReduceLROnPlateau(
+    monitor='val_loss', factor=0.5,
+    patience=3, min_lr=1e-6, verbose=1
+)
 
-# Pass through the frozen ResNet50V2
-x = base_model(x, training=False) 
+history2 = model.fit(
+    train_ds,
+    epochs=30,
+    validation_data=val_ds,
+    callbacks=[early_stop_phase2, reduce_lr]
+)
 
-# Convert the features to a single vector per image
-x = layers.GlobalAveragePooling2D()(x)
-
-# Add a dropout layer to fight overfitting
-x = layers.Dropout(0.2)(x)
-
-# Create our custom output layer with 8 neurons (one for each blood group)
-outputs = layers.Dense(8, activation='softmax')(x)
-model = keras.Model(inputs, outputs)
-
-# Compile the model
-# Using a very low learning rate for fine-tuning so we don't destroy the pre-trained weights
-print("Compiling model for Fine-Tuning...")
-model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0001),
-              loss='categorical_crossentropy',
-              metrics=['accuracy'])
-
-model.summary()
-
-# Callbacks: Automate the training process so it perfectly stops when accuracy peaks
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-
-early_stopping = EarlyStopping(monitor='val_accuracy', patience=4, restore_best_weights=True, verbose=1)
-reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6, verbose=1)
-
-# Train the top layer
-print("Training custom classification head & Top 30 ResNet Layers...")
-history = model.fit(train_ds,
-                    epochs=20, # Let EarlyStopping decide when to quit
-                    validation_data=val_ds,
-                    callbacks=[early_stopping, reduce_lr])
-
-# Save the mighty new brain
+# ─────────────────────────────────────────
+# Save model
+# ─────────────────────────────────────────
 model.save("resnet_fingerprint_model.keras")
-print("\nSuccess! Saved fine-tuned maximum-accuracy model to resnet_fingerprint_model.keras")
+print("\n✅ Saved fine-tuned model to resnet_fingerprint_model.keras")
+
+# ─────────────────────────────────────────
+# Final evaluation
+# ─────────────────────────────────────────
+loss, acc = model.evaluate(val_ds, verbose=0)
+print(f"✅ Final Validation Accuracy: {acc*100:.2f}%")
